@@ -19,6 +19,7 @@ package main
 
 import (
 	"flag"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -37,13 +38,19 @@ func main() {
 		masterURL  string
 		kubeconfig string
 		nodeName   string
+		cniDir     string
 	)
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
 	flag.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
 	flag.StringVar(&nodeName, "node-name", "", "The name of this node.")
+	flag.StringVar(&cniDir, "cni-dir", "/etc/cni/net.d", "The directory for CNI config files.")
 
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	if nodeName == "" {
+		log.Fatalf("node-name is a required argument")
+	}
 
 	// set up signals so we handle the first shutdown signal gracefully
 	stopCh := make(chan struct{})
@@ -76,7 +83,7 @@ func main() {
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
 	dynInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0)
 
-	c := newController(kubeClient, dynClient, gvr, nodeName,
+	c := newController(kubeClient, dynClient, gvr, nodeName, cniDir,
 		kubeInformerFactory.Core().V1().Nodes(),
 		dynInformerFactory.ForResource(gvr).Informer())
 

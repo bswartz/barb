@@ -18,8 +18,11 @@ limitations under the License.
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -58,6 +61,7 @@ type controller struct {
 	lastCidr4   string
 	lastCidr6   string
 	routes      map[string]string
+	cniDir      string
 }
 
 func newController(
@@ -65,6 +69,7 @@ func newController(
 	dynClient dynamic.Interface,
 	gvr schema.GroupVersionResource,
 	nodeName string,
+	cniDir string,
 	nodeInformer coreinformers.NodeInformer,
 	dynInformer cache.SharedIndexInformer,
 ) *controller {
@@ -79,6 +84,7 @@ func newController(
 		dynSynced:   dynInformer.HasSynced,
 		workqueue:   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Barbs"),
 		routes:      make(map[string]string),
+		cniDir:      cniDir,
 	}
 
 	klog.Info("Setting up event handlers")
@@ -223,13 +229,94 @@ func (c *controller) syncNode(ctx context.Context, nodeName string) error {
 	return nil
 }
 
-func (c *controller) configureBridge(_ context.Context, cidr4, cidr6 string) error {
+func createBridgeConf(cidr4, cidr6 string) any {
+	// https://github.com/containernetworking/cni/blob/main/pkg/types/types.go
+	type Route struct {
+		Dst string `json:"dst"`
+		GW  string `json:"gw,omitempty"`
+	}
+
+	// https://github.com/containernetworking/plugins/blob/main/plugins/ipam/host-local/backend/allocator/config.go
+	type Range struct {
+		RangeStart string `json:"rangeStart,omitempty"` // The first ip, inclusive
+		RangeEnd   string `json:"rangeEnd,omitempty"`   // The last ip, inclusive
+		Subnet     string `json:"subnet"`
+		Gateway    string `json:"gateway,omitempty"`
+	}
+
+	type RangeSet []Range
+
+	var ranges []RangeSet
+	var routes []*Route
+
+	if cidr4 != "" {
+		ranges = append(ranges, []Range{{Subnet: cidr4}})
+		routes = append(routes, &Route{Dst: "0.0.0.0/0"})
+	}
+	if cidr6 != "" {
+		ranges = append(ranges, []Range{{Subnet: cidr6}})
+		routes = append(routes, &Route{Dst: "::/0"})
+	}
+
+	type IPAMConfig struct {
+		Type   string     `json:"type,omitempty"`
+		Routes []*Route   `json:"routes"`
+		Ranges []RangeSet `json:"ranges"`
+	}
+
+	// https://github.com/containernetworking/plugins/blob/main/plugins/main/bridge/bridge.go
+	type NetConf struct {
+		CNIVersion string     `json:"cniVersion,omitempty"`
+		Name       string     `json:"name,omitempty"`
+		Type       string     `json:"type,omitempty"`
+		BrName     string     `json:"bridge"`
+		IsGW       bool       `json:"isGateway"`
+		IPMasq     bool       `json:"ipMasq"`
+		IPAM       IPAMConfig `json:"ipam,omitempty"`
+	}
+
+	return &NetConf{
+		CNIVersion: "0.6.0",
+		Name:       "bridge",
+		Type:       "bridge",
+		BrName:     "cni0",
+		IsGW:       true,
+		IPMasq:     true,
+		IPAM: IPAMConfig{
+			Type:   "host-local",
+			Ranges: ranges,
+			Routes: routes,
+		},
+	}
+}
+
+func (c *controller) configureBridge(cidr4, cidr6 string) error {
 	if c.lastCidr4 == cidr4 && c.lastCidr6 == cidr6 {
 		// No change
 		return nil
 	}
 
-	// TODO: Configure local CNI plugin
+	confPath := filepath.Join(c.cniDir, "90-bridge.conf")
+	tmpPath := confPath + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+
+	conf := createBridgeConf(cidr4, cidr6)
+	err = json.NewEncoder(f).Encode(conf)
+	f.Close()
+	if err != nil {
+		return err
+	}
+
+	err = os.Rename(tmpPath, confPath)
+	if err != nil {
+		return err
+	}
+
+	c.lastCidr4 = cidr4
+	c.lastCidr6 = cidr6
 
 	return nil
 }
@@ -349,8 +436,8 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 		}
 	}
 
-	err = c.configureBridge(ctx, cidr4, cidr6)
-	if nil != err {
+	err = c.configureBridge(cidr4, cidr6)
+	if err != nil {
 		return err
 	}
 
