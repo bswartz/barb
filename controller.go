@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -36,7 +37,6 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// Controller is the controller implementation for Foo resources
 type Controller struct {
 	kubeclientset kubernetes.Interface
 	nodesLister   corelisters.NodeLister
@@ -50,8 +50,8 @@ func NewController(
 	kubeclientset kubernetes.Interface,
 	gvr schema.GroupVersionResource,
 	nodeInformer coreinformers.NodeInformer,
-	dynInformer cache.SharedIndexInformer) *Controller {
-
+	dynInformer cache.SharedIndexInformer,
+) *Controller {
 	controller := &Controller{
 		kubeclientset: kubeclientset,
 		nodesLister:   nodeInformer.Lister(),
@@ -62,16 +62,20 @@ func NewController(
 	}
 
 	klog.Info("Setting up event handlers")
-	// Set up an event handler for when Foo resources change
 	dynInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.enqueueUnstructured,
-		UpdateFunc: func(old, new interface{}) {
-			controller.enqueueUnstructured(new)
+		AddFunc: controller.enqueueBarb,
+		UpdateFunc: func(old, new any) {
+			newBarb := new.(*unstructured.Unstructured)
+			oldBarb := old.(*unstructured.Unstructured)
+			if newBarb.GetResourceVersion() == oldBarb.GetResourceVersion() {
+				return
+			}
+			controller.enqueueBarb(new)
 		},
 	})
 	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.handleObject,
-		UpdateFunc: func(old, new interface{}) {
+		UpdateFunc: func(old, new any) {
 			newNode := new.(*corev1.Node)
 			oldNode := old.(*corev1.Node)
 			if newNode.ResourceVersion == oldNode.ResourceVersion {
@@ -94,7 +98,7 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) error {
 	defer c.workqueue.ShutDown()
 
 	// Start the informer factories to begin populating the informer caches
-	klog.Info("Starting Foo controller")
+	klog.Info("Starting Barb controller")
 
 	// Wait for the caches to be synced before starting workers
 	klog.Info("Waiting for informer caches to sync")
@@ -103,7 +107,7 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) error {
 	}
 
 	klog.Info("Starting workers")
-	// Launch two workers to process Foo resources
+	// Launch two workers to process Barb resources
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
@@ -133,7 +137,7 @@ func (c *Controller) processNextWorkItem() bool {
 	}
 
 	// We wrap this block in a func so we can defer c.workqueue.Done.
-	err := func(obj interface{}) error {
+	err := func(obj any) error {
 		// We call Done here so the workqueue knows we have finished
 		// processing this item. We also must remember to call Forget if we
 		// do not want this work item being re-queued. For example, we do
@@ -157,7 +161,7 @@ func (c *Controller) processNextWorkItem() bool {
 			return nil
 		}
 		// Run the syncHandler, passing it the namespace/name string of the
-		// Foo resource to be synced.
+		// Barb resource to be synced.
 		if err := c.syncHandler(key); err != nil {
 			// Put the item back on the workqueue to handle any transient errors.
 			c.workqueue.AddRateLimited(key)
@@ -169,7 +173,6 @@ func (c *Controller) processNextWorkItem() bool {
 		klog.Infof("Successfully synced '%s'", key)
 		return nil
 	}(obj)
-
 	if err != nil {
 		utilruntime.HandleError(err)
 		return true
@@ -179,16 +182,16 @@ func (c *Controller) processNextWorkItem() bool {
 }
 
 // syncHandler compares the actual state with the desired, and attempts to
-// converge the two. It then updates the Status block of the Foo resource
+// converge the two. It then updates the Status block of the Barb resource
 // with the current status of the resource.
 func (c *Controller) syncHandler(key string) error {
-	// Get the Foo resource with this namespace/name
+	// Get the Barb resource with this namespace/name
 	_, err := c.dynLister.Get(key)
 	if err != nil {
-		// The Foo resource may no longer exist, in which case we stop
+		// The Barb resource may no longer exist, in which case we stop
 		// processing.
 		if errors.IsNotFound(err) {
-			utilruntime.HandleError(fmt.Errorf("foo '%s' in work queue no longer exists", key))
+			utilruntime.HandleError(fmt.Errorf("barb '%s' in work queue no longer exists", key))
 			return nil
 		}
 
@@ -198,17 +201,14 @@ func (c *Controller) syncHandler(key string) error {
 	return nil
 }
 
-func (c *Controller) enqueueUnstructured(obj interface{}) {
-	var key string
-	var err error
-	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
-		utilruntime.HandleError(err)
-		return
+func (c *Controller) enqueueBarb(obj any) {
+	barb, ok := obj.(unstructured.Unstructured)
+	if ok {
+		c.workqueue.Add(barb.GetName())
 	}
-	c.workqueue.Add(key)
 }
 
-func (c *Controller) handleObject(obj interface{}) {
+func (c *Controller) handleObject(obj any) {
 	var object metav1.Object
 	var ok bool
 	if object, ok = obj.(metav1.Object); !ok {
@@ -226,19 +226,19 @@ func (c *Controller) handleObject(obj interface{}) {
 	}
 	klog.V(4).Infof("Processing object: %s", object.GetName())
 	if ownerRef := metav1.GetControllerOf(object); ownerRef != nil {
-		// If this object is not owned by a Foo, we should not do anything more
+		// If this object is not owned by a Bab, we should not do anything more
 		// with it.
-		if ownerRef.Kind != "Foo" {
+		if ownerRef.Kind != "Barb" {
 			return
 		}
 
-		unst, err := c.dynLister.Get(ownerRef.Name)
+		barb, err := c.dynLister.Get(ownerRef.Name)
 		if err != nil {
-			klog.V(4).Infof("ignoring orphaned object '%s' of foo '%s'", object.GetName(), ownerRef.Name)
+			klog.V(4).Infof("ignoring orphaned object '%s' of barb '%s'", object.GetName(), ownerRef.Name)
 			return
 		}
 
-		c.enqueueUnstructured(unst)
+		c.enqueueBarb(barb)
 		return
 	}
 }
