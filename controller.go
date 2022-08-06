@@ -22,7 +22,9 @@ import (
 	"net"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/net/context"
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,6 +42,8 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 )
+
+const barbProto = 250
 
 type controller struct {
 	nodeName    string
@@ -124,7 +128,12 @@ func (c *controller) Run(workers int, stopCh <-chan struct{}) error {
 
 	klog.Info("Starting Barb controller")
 
-	err := c.readRoutes()
+	var err error
+	err = c.readRoutes(netlink.FAMILY_V4)
+	if err != nil {
+		return err
+	}
+	err = c.readRoutes(netlink.FAMILY_V6)
 	if err != nil {
 		return err
 	}
@@ -200,6 +209,7 @@ func (c *controller) syncNode(ctx context.Context, nodeName string) error {
 		}
 	} else {
 		// Convert the barb object
+		barb = new(Barb)
 		err = runtime.DefaultUnstructuredConverter.FromUnstructured(unst.UnstructuredContent(), barb)
 		if err != nil {
 			return err
@@ -224,20 +234,86 @@ func (c *controller) configureBridge(_ context.Context, cidr4, cidr6 string) err
 	return nil
 }
 
-func findOtherAddress(ip net.IP) *net.IP {
-	// TODO: Find address of opposite type on same link
-	return &net.IP{}
+func isLinkLocak(ip net.IP) bool {
+	switch len(ip) {
+	case net.IPv4len:
+		return 169 == ip[0] && 254 == ip[1]
+	case net.IPv6len:
+		return 0xfe == ip[0] && 0x80 == (ip[1]&0xc0)
+	default:
+		return false
+	}
 }
 
-func (c *controller) readRoutes() error {
-	// TODO: Read the routing table
+func findOtherAddress(ip net.IP) (*net.IP, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil, err
+	}
+	for _, link := range links {
+		var addrs []netlink.Addr
+		addrs, err = netlink.AddrList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			return nil, err
+		}
+		found := false
+		var otherIp net.IP
+		for _, addr := range addrs {
+			if ip.Equal(addr.IP) {
+				found = true
+			} else if len(addr.IP) == len(ip) {
+				// Same addr type
+				continue
+			} else if isLinkLocak(addr.IP) {
+				continue
+			} else {
+				otherIp = addr.IP
+			}
+		}
+		if found {
+			return &otherIp, nil
+		}
+	}
+	return nil, fmt.Errorf("no link found")
+}
+
+func (c *controller) readRoutes(family int) error {
+	routes, err := netlink.RouteList(nil, family)
+	if err != nil {
+		return err
+	}
+	for _, route := range routes {
+		if nil == route.Dst || nil == route.Gw {
+			continue
+		}
+		c.routes[route.Dst.String()] = route.Gw.String()
+	}
+
 	return nil
 }
 
 func (c *controller) updateRoute(cidr, gw string) error {
-	// TODO: Update our route
+	_, dst, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return err
+	}
 
+	route := &netlink.Route{
+		Dst:      dst,
+		Gw:       net.ParseIP(gw),
+		Protocol: barbProto,
+		Table:    unix.RT_TABLE_MAIN,
+		Type:     unix.RTN_UNICAST,
+	}
+
+	err = netlink.RouteReplace(route)
+	if err != nil {
+		return err
+	}
+
+	// Remember the updated route
 	c.routes[cidr] = gw
+
 	return nil
 }
 
@@ -295,17 +371,22 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 		klog.ErrorS(err, "Invalid IP address", "ip", internalIp)
 		return err
 	}
+	// The node will only have an IPv4 or an IPv6, so find the other IP
+	// on the same link.
 	var otherIp *net.IP
+	otherIp, err = findOtherAddress(ip)
+	if err != nil {
+		return err
+	}
+
 	switch len(ip) {
 	case net.IPv4len:
 		gw4 = internalIp
-		otherIp = findOtherAddress(ip)
 		if otherIp != nil {
 			gw6 = otherIp.String()
 		}
 	case net.IPv6len:
 		gw6 = internalIp
-		otherIp = findOtherAddress(ip)
 		if otherIp != nil {
 			gw4 = otherIp.String()
 		}
@@ -317,10 +398,11 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 
 	needCreate := false
 	if nil == barb {
-		barb = &Barb{}
+		barb = new(Barb)
 		needCreate = true
 	}
 
+	// Compare desired/actual barb
 	if barb.Gateway4 == gw4 && barb.Gateway6 == gw6 && barb.Cidr4 == cidr4 && barb.Cidr4 == cidr6 {
 		// No work to do
 		return nil
@@ -363,15 +445,15 @@ func (c *controller) syncOtherNode(_ context.Context, barb *Barb) error {
 		// No work to do
 		return nil
 	}
-	var err error
+
 	if actualGw4 != barb.Gateway4 {
-		err = c.updateRoute(barb.Cidr4, barb.Gateway4)
+		err := c.updateRoute(barb.Cidr4, barb.Gateway4)
 		if err != nil {
 			return err
 		}
 	}
 	if actualGw6 != barb.Gateway6 {
-		err = c.updateRoute(barb.Cidr6, barb.Gateway6)
+		err := c.updateRoute(barb.Cidr6, barb.Gateway6)
 		if err != nil {
 			return err
 		}
