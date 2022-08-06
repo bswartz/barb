@@ -19,6 +19,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"time"
 
 	"golang.org/x/net/context"
@@ -203,13 +204,84 @@ func (c *controller) syncNode(ctx context.Context, nodeName string) error {
 	return nil
 }
 
+func findOtherAddress(ip net.IP) *net.IP {
+	// TODO: Find address of opposite type on same link
+	return &net.IP{}
+}
+
 func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
+	var err error
+	var node *corev1.Node
+	node, err = c.kubeClient.CoreV1().Nodes().Get(ctx, c.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	var internalIp string
+	for _, address := range node.Status.Addresses {
+		if address.Type == corev1.NodeInternalIP {
+			internalIp = address.Address
+			break
+		}
+	}
+	if "" == internalIp {
+		klog.Info("Node doesn't have internal IP yet")
+		return nil
+	}
+	ip := net.ParseIP(internalIp)
+	if ip == nil {
+		err = fmt.Errorf("invalid IP address")
+		klog.ErrorS(err, "Invalid IP address", "ip", internalIp)
+		return err
+	}
+	var otherIp *net.IP
+	var gw4, gw6, cidr4, cidr6 string
+	switch len(ip) {
+	case net.IPv4len:
+		gw4 = internalIp
+		otherIp = findOtherAddress(ip)
+		if otherIp != nil {
+			gw6 = otherIp.String()
+		}
+	case net.IPv6len:
+		gw6 = internalIp
+		otherIp = findOtherAddress(ip)
+		if otherIp != nil {
+			gw4 = otherIp.String()
+		}
+	default:
+		err = fmt.Errorf("unknown IP address type")
+		klog.ErrorS(err, "unknown IP address type", "ip", ip)
+		return err
+	}
+	cidrs := node.Spec.PodCIDRs
+	if len(cidrs) == 0 {
+		cidrs = []string{node.Spec.PodCIDR}
+	}
+	for _, cidr := range cidrs {
+		var n *net.IPNet
+		_, n, err = net.ParseCIDR(cidr)
+		if err != nil {
+			klog.ErrorS(err, "invalid cidr", "cidr", cidr)
+			return err
+		}
+		switch len(n.IP) {
+		case net.IPv4len:
+			cidr4 = cidr
+		case net.IPv6len:
+			cidr6 = cidr
+		default:
+			err = fmt.Errorf("unknown IP address type")
+			klog.ErrorS(err, "unknown IP address type", "ip", n.IP)
+			return err
+		}
+	}
+
 	needCreate := false
 	if nil == barb {
 		barb = &Barb{}
 		needCreate = true
 	}
-	var err error
 
 	// TODO: Compute the desired barb and compare it to the actual barb
 
