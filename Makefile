@@ -19,10 +19,13 @@ export GOOS=linux
 export GOARCH=amd64
 REV=$(shell git describe --long --tags --match='v*' --dirty)
 
-all: compile
+all: build
 
 compile:
 	mkdir -p bin
 	go build -ldflags '-s -w -X main.version=$(REV)' -o bin/barb *.go
 
-.PHONY: all compile
+build: compile
+	deploy/build.sh quay.io/bswartz/barb:canary
+
+.PHONY: all compile build

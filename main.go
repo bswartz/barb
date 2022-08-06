@@ -33,6 +33,8 @@ import (
 	"k8s.io/klog/v2"
 )
 
+var version = "unknown"
+
 func main() {
 	var (
 		masterURL  string
