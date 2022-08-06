@@ -21,16 +21,16 @@ import (
 	"fmt"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic/dynamiclister"
-	appsinformers "k8s.io/client-go/informers/apps/v1"
+	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
-	appslisters "k8s.io/client-go/listers/apps/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -38,36 +38,27 @@ import (
 
 // Controller is the controller implementation for Foo resources
 type Controller struct {
-	// kubeclientset is a standard kubernetes clientset
 	kubeclientset kubernetes.Interface
-
-	deploymentsLister appslisters.DeploymentLister
-	deploymentsSynced cache.InformerSynced
-	dynLister         dynamiclister.Lister
-	dynSynced         cache.InformerSynced
-
-	// workqueue is a rate limited work queue. This is used to queue work to be
-	// processed instead of performing it as soon as a change happens. This
-	// means we can ensure we only process a fixed amount of resources at a
-	// time, and makes it easy to ensure we are never processing the same item
-	// simultaneously in two different workers.
-	workqueue workqueue.RateLimitingInterface
+	nodesLister   corelisters.NodeLister
+	nodesSynced   cache.InformerSynced
+	dynLister     dynamiclister.Lister
+	dynSynced     cache.InformerSynced
+	workqueue     workqueue.RateLimitingInterface
 }
 
-// NewController returns a new sample controller
 func NewController(
 	kubeclientset kubernetes.Interface,
 	gvr schema.GroupVersionResource,
-	deploymentInformer appsinformers.DeploymentInformer,
+	nodeInformer coreinformers.NodeInformer,
 	dynInformer cache.SharedIndexInformer) *Controller {
 
 	controller := &Controller{
-		kubeclientset:     kubeclientset,
-		deploymentsLister: deploymentInformer.Lister(),
-		deploymentsSynced: deploymentInformer.Informer().HasSynced,
-		dynLister:         dynamiclister.New(dynInformer.GetIndexer(), gvr),
-		dynSynced:         dynInformer.HasSynced,
-		workqueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Foos"),
+		kubeclientset: kubeclientset,
+		nodesLister:   nodeInformer.Lister(),
+		nodesSynced:   nodeInformer.Informer().HasSynced,
+		dynLister:     dynamiclister.New(dynInformer.GetIndexer(), gvr),
+		dynSynced:     dynInformer.HasSynced,
+		workqueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Barbs"),
 	}
 
 	klog.Info("Setting up event handlers")
@@ -78,20 +69,12 @@ func NewController(
 			controller.enqueueUnstructured(new)
 		},
 	})
-	// Set up an event handler for when Deployment resources change. This
-	// handler will lookup the owner of the given Deployment, and if it is
-	// owned by a Foo resource then the handler will enqueue that Foo resource for
-	// processing. This way, we don't need to implement custom logic for
-	// handling Deployment resources. More info on this pattern:
-	// https://github.com/kubernetes/community/blob/8cafef897a22026d42f5e5bb3f104febe7e29830/contributors/devel/controllers.md
-	deploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.handleObject,
 		UpdateFunc: func(old, new interface{}) {
-			newDepl := new.(*appsv1.Deployment)
-			oldDepl := old.(*appsv1.Deployment)
-			if newDepl.ResourceVersion == oldDepl.ResourceVersion {
-				// Periodic resync will send update events for all known Deployments.
-				// Two different versions of the same Deployment will always have different RVs.
+			newNode := new.(*corev1.Node)
+			oldNode := old.(*corev1.Node)
+			if newNode.ResourceVersion == oldNode.ResourceVersion {
 				return
 			}
 			controller.handleObject(new)
@@ -115,7 +98,7 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) error {
 
 	// Wait for the caches to be synced before starting workers
 	klog.Info("Waiting for informer caches to sync")
-	if ok := cache.WaitForCacheSync(stopCh, c.deploymentsSynced, c.dynSynced); !ok {
+	if ok := cache.WaitForCacheSync(stopCh, c.nodesSynced, c.dynSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
@@ -225,11 +208,6 @@ func (c *Controller) enqueueUnstructured(obj interface{}) {
 	c.workqueue.Add(key)
 }
 
-// handleObject will take any resource implementing metav1.Object and attempt
-// to find the Foo resource that 'owns' it. It does this by looking at the
-// objects metadata.ownerReferences field for an appropriate OwnerReference.
-// It then enqueues that Foo resource to be processed. If the object does not
-// have an appropriate OwnerReference, it will simply be skipped.
 func (c *Controller) handleObject(obj interface{}) {
 	var object metav1.Object
 	var ok bool

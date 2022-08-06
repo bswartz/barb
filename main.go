@@ -22,7 +22,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
@@ -73,15 +72,13 @@ func main() {
 
 	gvr := schema.GroupVersionResource{Group: "barb", Version: "v1", Resource: "barbs"}
 
-	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
-	dynInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, time.Second*30)
+	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, 0)
+	dynInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0)
 
 	controller := NewController(kubeClient, gvr,
-		kubeInformerFactory.Apps().V1().Deployments(),
+		kubeInformerFactory.Core().V1().Nodes(),
 		dynInformerFactory.ForResource(gvr).Informer())
 
-	// notice that there is no need to run Start methods in a separate goroutine. (i.e. go kubeInformerFactory.Start(stopCh)
-	// Start method is non-blocking and runs all registered informers in a dedicated goroutine.
 	kubeInformerFactory.Start(stopCh)
 	dynInformerFactory.Start(stopCh)
 
