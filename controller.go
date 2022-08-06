@@ -51,6 +51,9 @@ type controller struct {
 	dynLister   dynamiclister.Lister
 	dynSynced   cache.InformerSynced
 	workqueue   workqueue.RateLimitingInterface
+	lastCidr4   string
+	lastCidr6   string
+	routes      map[string]string
 }
 
 func newController(
@@ -71,6 +74,7 @@ func newController(
 		dynLister:   dynamiclister.New(dynInformer.GetIndexer(), gvr),
 		dynSynced:   dynInformer.HasSynced,
 		workqueue:   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Barbs"),
+		routes:      make(map[string]string),
 	}
 
 	klog.Info("Setting up event handlers")
@@ -119,6 +123,11 @@ func (c *controller) Run(workers int, stopCh <-chan struct{}) error {
 	defer c.workqueue.ShutDown()
 
 	klog.Info("Starting Barb controller")
+
+	err := c.readRoutes()
+	if err != nil {
+		return err
+	}
 
 	klog.Info("Waiting for informer caches to sync")
 	if ok := cache.WaitForCacheSync(stopCh, c.nodesSynced, c.dynSynced); !ok {
@@ -204,9 +213,32 @@ func (c *controller) syncNode(ctx context.Context, nodeName string) error {
 	return nil
 }
 
+func (c *controller) configureBridge(_ context.Context, cidr4, cidr6 string) error {
+	if c.lastCidr4 == cidr4 && c.lastCidr6 == cidr6 {
+		// No change
+		return nil
+	}
+
+	// TODO: Configure local CNI plugin
+
+	return nil
+}
+
 func findOtherAddress(ip net.IP) *net.IP {
 	// TODO: Find address of opposite type on same link
 	return &net.IP{}
+}
+
+func (c *controller) readRoutes() error {
+	// TODO: Read the routing table
+	return nil
+}
+
+func (c *controller) updateRoute(cidr, gw string) error {
+	// TODO: Update our route
+
+	c.routes[cidr] = gw
+	return nil
 }
 
 func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
@@ -217,43 +249,7 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 		return err
 	}
 
-	var internalIp string
-	for _, address := range node.Status.Addresses {
-		if address.Type == corev1.NodeInternalIP {
-			internalIp = address.Address
-			break
-		}
-	}
-	if "" == internalIp {
-		klog.Info("Node doesn't have internal IP yet")
-		return nil
-	}
-	ip := net.ParseIP(internalIp)
-	if ip == nil {
-		err = fmt.Errorf("invalid IP address")
-		klog.ErrorS(err, "Invalid IP address", "ip", internalIp)
-		return err
-	}
-	var otherIp *net.IP
 	var gw4, gw6, cidr4, cidr6 string
-	switch len(ip) {
-	case net.IPv4len:
-		gw4 = internalIp
-		otherIp = findOtherAddress(ip)
-		if otherIp != nil {
-			gw6 = otherIp.String()
-		}
-	case net.IPv6len:
-		gw6 = internalIp
-		otherIp = findOtherAddress(ip)
-		if otherIp != nil {
-			gw4 = otherIp.String()
-		}
-	default:
-		err = fmt.Errorf("unknown IP address type")
-		klog.ErrorS(err, "unknown IP address type", "ip", ip)
-		return err
-	}
 	cidrs := node.Spec.PodCIDRs
 	if len(cidrs) == 0 {
 		cidrs = []string{node.Spec.PodCIDR}
@@ -277,14 +273,66 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 		}
 	}
 
+	err = c.configureBridge(ctx, cidr4, cidr6)
+	if nil != err {
+		return err
+	}
+
+	var internalIp string
+	for _, address := range node.Status.Addresses {
+		if address.Type == corev1.NodeInternalIP {
+			internalIp = address.Address
+			break
+		}
+	}
+	if "" == internalIp {
+		klog.Info("Node doesn't have internal IP yet")
+		return nil
+	}
+	ip := net.ParseIP(internalIp)
+	if ip == nil {
+		err = fmt.Errorf("invalid IP address")
+		klog.ErrorS(err, "Invalid IP address", "ip", internalIp)
+		return err
+	}
+	var otherIp *net.IP
+	switch len(ip) {
+	case net.IPv4len:
+		gw4 = internalIp
+		otherIp = findOtherAddress(ip)
+		if otherIp != nil {
+			gw6 = otherIp.String()
+		}
+	case net.IPv6len:
+		gw6 = internalIp
+		otherIp = findOtherAddress(ip)
+		if otherIp != nil {
+			gw4 = otherIp.String()
+		}
+	default:
+		err = fmt.Errorf("unknown IP address type")
+		klog.ErrorS(err, "unknown IP address type", "ip", ip)
+		return err
+	}
+
 	needCreate := false
 	if nil == barb {
 		barb = &Barb{}
 		needCreate = true
 	}
 
-	// TODO: Compute the desired barb and compare it to the actual barb
+	if barb.Gateway4 == gw4 && barb.Gateway6 == gw6 && barb.Cidr4 == cidr4 && barb.Cidr4 == cidr6 {
+		// No work to do
+		return nil
+	}
 
+	// Update the barb
+	barb.Gateway4 = gw4
+	barb.Gateway6 = gw6
+	barb.Cidr4 = cidr4
+	barb.Cidr4 = cidr6
+
+	// Convert to unstructured
 	var object map[string]any
 	object, err = runtime.DefaultUnstructuredConverter.ToUnstructured(barb)
 	if err != nil {
@@ -292,6 +340,7 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 	}
 	unst := &unstructured.Unstructured{Object: object}
 
+	// Either create or update the barb, as needed
 	if needCreate {
 		_, err = c.dynClient.Resource(c.gvr).Create(ctx, unst, metav1.CreateOptions{})
 		if err != nil {
@@ -307,9 +356,26 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 	return nil
 }
 
-func (c *controller) syncOtherNode(_ context.Context, _ *Barb) error {
-
-	// TODO: Update our local routing table with information from the other node
+func (c *controller) syncOtherNode(_ context.Context, barb *Barb) error {
+	actualGw4 := c.routes[barb.Cidr4]
+	actualGw6 := c.routes[barb.Cidr6]
+	if actualGw4 == barb.Gateway4 && actualGw6 == barb.Gateway6 {
+		// No work to do
+		return nil
+	}
+	var err error
+	if actualGw4 != barb.Gateway4 {
+		err = c.updateRoute(barb.Cidr4, barb.Gateway4)
+		if err != nil {
+			return err
+		}
+	}
+	if actualGw6 != barb.Gateway6 {
+		err = c.updateRoute(barb.Cidr6, barb.Gateway6)
+		if err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
