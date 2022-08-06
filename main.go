@@ -26,20 +26,21 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
-	kubeinformers "k8s.io/client-go/informers"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 )
 
-var (
-	masterURL  string
-	kubeconfig string
-)
-
 func main() {
+	var (
+		masterURL  string
+		kubeconfig string
+		nodeName   string
+	)
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
 	flag.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
+	flag.StringVar(&nodeName, "node-name", "", "The name of this node.")
 
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -72,17 +73,17 @@ func main() {
 
 	gvr := schema.GroupVersionResource{Group: "barb", Version: "v1", Resource: "barbs"}
 
-	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, 0)
+	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
 	dynInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0)
 
-	controller := NewController(kubeClient, gvr,
+	c := newController(kubeClient, dynClient, gvr, nodeName,
 		kubeInformerFactory.Core().V1().Nodes(),
 		dynInformerFactory.ForResource(gvr).Informer())
 
 	kubeInformerFactory.Start(stopCh)
 	dynInformerFactory.Start(stopCh)
 
-	if err = controller.Run(2, stopCh); err != nil {
+	if err = c.Run(2, stopCh); err != nil {
 		klog.Fatalf("Error running controller: %s", err.Error())
 	}
 }

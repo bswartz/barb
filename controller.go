@@ -21,13 +21,16 @@ import (
 	"fmt"
 	"time"
 
+	"golang.org/x/net/context"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamiclister"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -37,77 +40,91 @@ import (
 	"k8s.io/klog/v2"
 )
 
-type Controller struct {
-	kubeclientset kubernetes.Interface
-	nodesLister   corelisters.NodeLister
-	nodesSynced   cache.InformerSynced
-	dynLister     dynamiclister.Lister
-	dynSynced     cache.InformerSynced
-	workqueue     workqueue.RateLimitingInterface
+type controller struct {
+	nodeName    string
+	kubeClient  kubernetes.Interface
+	dynClient   dynamic.Interface
+	gvr         schema.GroupVersionResource
+	nodesLister corelisters.NodeLister
+	nodesSynced cache.InformerSynced
+	dynLister   dynamiclister.Lister
+	dynSynced   cache.InformerSynced
+	workqueue   workqueue.RateLimitingInterface
 }
 
-func NewController(
-	kubeclientset kubernetes.Interface,
+func newController(
+	kubeClient kubernetes.Interface,
+	dynClient dynamic.Interface,
 	gvr schema.GroupVersionResource,
+	nodeName string,
 	nodeInformer coreinformers.NodeInformer,
 	dynInformer cache.SharedIndexInformer,
-) *Controller {
-	controller := &Controller{
-		kubeclientset: kubeclientset,
-		nodesLister:   nodeInformer.Lister(),
-		nodesSynced:   nodeInformer.Informer().HasSynced,
-		dynLister:     dynamiclister.New(dynInformer.GetIndexer(), gvr),
-		dynSynced:     dynInformer.HasSynced,
-		workqueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Barbs"),
+) *controller {
+	c := &controller{
+		nodeName:    nodeName,
+		kubeClient:  kubeClient,
+		dynClient:   dynClient,
+		gvr:         gvr,
+		nodesLister: nodeInformer.Lister(),
+		nodesSynced: nodeInformer.Informer().HasSynced,
+		dynLister:   dynamiclister.New(dynInformer.GetIndexer(), gvr),
+		dynSynced:   dynInformer.HasSynced,
+		workqueue:   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Barbs"),
 	}
 
 	klog.Info("Setting up event handlers")
 	dynInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.enqueueBarb,
+		AddFunc: c.enqueueBarb,
 		UpdateFunc: func(old, new any) {
 			newBarb := new.(*unstructured.Unstructured)
 			oldBarb := old.(*unstructured.Unstructured)
 			if newBarb.GetResourceVersion() == oldBarb.GetResourceVersion() {
 				return
 			}
-			controller.enqueueBarb(new)
+			c.enqueueBarb(new)
 		},
 	})
 	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.handleObject,
+		AddFunc: c.handleNode,
 		UpdateFunc: func(old, new any) {
 			newNode := new.(*corev1.Node)
 			oldNode := old.(*corev1.Node)
 			if newNode.ResourceVersion == oldNode.ResourceVersion {
 				return
 			}
-			controller.handleObject(new)
+			c.handleNode(new)
 		},
-		DeleteFunc: controller.handleObject,
 	})
 
-	return controller
+	return c
 }
 
-// Run will set up the event handlers for types we are interested in, as well
-// as syncing informer caches and starting workers. It will block until stopCh
-// is closed, at which point it will shutdown the workqueue and wait for
-// workers to finish processing their current work items.
-func (c *Controller) Run(workers int, stopCh <-chan struct{}) error {
+func (c *controller) enqueueBarb(obj any) {
+	barb, ok := obj.(unstructured.Unstructured)
+	if ok {
+		c.workqueue.Add(barb.GetName())
+	}
+}
+
+func (c *controller) handleNode(obj any) {
+	node, ok := obj.(corev1.Node)
+	if ok && c.nodeName == node.Name {
+		c.workqueue.Add(node.Name)
+	}
+}
+
+func (c *controller) Run(workers int, stopCh <-chan struct{}) error {
 	defer utilruntime.HandleCrash()
 	defer c.workqueue.ShutDown()
 
-	// Start the informer factories to begin populating the informer caches
 	klog.Info("Starting Barb controller")
 
-	// Wait for the caches to be synced before starting workers
 	klog.Info("Waiting for informer caches to sync")
 	if ok := cache.WaitForCacheSync(stopCh, c.nodesSynced, c.dynSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
 	klog.Info("Starting workers")
-	// Launch two workers to process Barb resources
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
@@ -119,58 +136,41 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) error {
 	return nil
 }
 
-// runWorker is a long-running function that will continually call the
-// processNextWorkItem function in order to read and process a message on the
-// workqueue.
-func (c *Controller) runWorker() {
+func (c *controller) runWorker() {
 	for c.processNextWorkItem() {
 	}
 }
 
-// processNextWorkItem will read a single work item off the workqueue and
-// attempt to process it, by calling the syncHandler.
-func (c *Controller) processNextWorkItem() bool {
+func (c *controller) processNextWorkItem() bool {
 	obj, shutdown := c.workqueue.Get()
 
 	if shutdown {
 		return false
 	}
 
-	// We wrap this block in a func so we can defer c.workqueue.Done.
 	err := func(obj any) error {
-		// We call Done here so the workqueue knows we have finished
-		// processing this item. We also must remember to call Forget if we
-		// do not want this work item being re-queued. For example, we do
-		// not call Forget if a transient error occurs, instead the item is
-		// put back on the workqueue and attempted again after a back-off
-		// period.
 		defer c.workqueue.Done(obj)
-		var key string
+		var nodeName string
 		var ok bool
-		// We expect strings to come off the workqueue. These are of the
-		// form namespace/name. We do this as the delayed nature of the
+		// We expect strings to come off the workqueue. These are the names
+		// the node (possibly this node). We do this as the delayed nature of the
 		// workqueue means the items in the informer cache may actually be
 		// more up to date that when the item was initially put onto the
 		// workqueue.
-		if key, ok = obj.(string); !ok {
-			// As the item in the workqueue is actually invalid, we call
-			// Forget here else we'd go into a loop of attempting to
-			// process a work item that is invalid.
+		if nodeName, ok = obj.(string); !ok {
 			c.workqueue.Forget(obj)
 			utilruntime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
 			return nil
 		}
-		// Run the syncHandler, passing it the namespace/name string of the
-		// Barb resource to be synced.
-		if err := c.syncHandler(key); err != nil {
+		if err := c.syncNode(context.TODO(), nodeName); err != nil {
 			// Put the item back on the workqueue to handle any transient errors.
-			c.workqueue.AddRateLimited(key)
-			return fmt.Errorf("error syncing '%s': %s, requeuing", key, err.Error())
+			c.workqueue.AddRateLimited(nodeName)
+			return fmt.Errorf("error syncing '%s': %s, requeuing", nodeName, err.Error())
 		}
 		// Finally, if no error occurs we Forget this item so it does not
 		// get queued again until another change happens.
 		c.workqueue.Forget(obj)
-		klog.Infof("Successfully synced '%s'", key)
+		klog.Infof("Successfully synced '%s'", nodeName)
 		return nil
 	}(obj)
 	if err != nil {
@@ -181,64 +181,63 @@ func (c *Controller) processNextWorkItem() bool {
 	return true
 }
 
-// syncHandler compares the actual state with the desired, and attempts to
-// converge the two. It then updates the Status block of the Barb resource
-// with the current status of the resource.
-func (c *Controller) syncHandler(key string) error {
-	// Get the Barb resource with this namespace/name
-	_, err := c.dynLister.Get(key)
+func (c *controller) syncNode(ctx context.Context, nodeName string) error {
+	var barb *Barb
+	unst, err := c.dynLister.Get(c.nodeName)
 	if err != nil {
-		// The Barb resource may no longer exist, in which case we stop
-		// processing.
-		if errors.IsNotFound(err) {
-			utilruntime.HandleError(fmt.Errorf("barb '%s' in work queue no longer exists", key))
-			return nil
+		if !errors.IsNotFound(err) {
+			return err
 		}
+	} else {
+		// Convert the barb object
+		err = runtime.DefaultUnstructuredConverter.FromUnstructured(unst.UnstructuredContent(), barb)
+		if err != nil {
+			return err
+		}
+	}
+	if c.nodeName == nodeName {
+		return c.syncSelf(ctx, barb)
+	} else if nil != barb {
+		return c.syncOtherNode(ctx, barb)
+	}
+	return nil
+}
 
+func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
+	needCreate := false
+	if nil == barb {
+		barb = &Barb{}
+		needCreate = true
+	}
+	var err error
+
+	// TODO: Compute the desired barb and compare it to the actual barb
+
+	var object map[string]any
+	object, err = runtime.DefaultUnstructuredConverter.ToUnstructured(barb)
+	if err != nil {
 		return err
+	}
+	unst := &unstructured.Unstructured{Object: object}
+
+	if needCreate {
+		_, err = c.dynClient.Resource(c.gvr).Create(ctx, unst, metav1.CreateOptions{})
+		if err != nil {
+			return err
+		}
+	} else {
+		_, err = c.dynClient.Resource(c.gvr).Update(ctx, unst, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func (c *Controller) enqueueBarb(obj any) {
-	barb, ok := obj.(unstructured.Unstructured)
-	if ok {
-		c.workqueue.Add(barb.GetName())
-	}
-}
+func (c *controller) syncOtherNode(_ context.Context, _ *Barb) error {
 
-func (c *Controller) handleObject(obj any) {
-	var object metav1.Object
-	var ok bool
-	if object, ok = obj.(metav1.Object); !ok {
-		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			utilruntime.HandleError(fmt.Errorf("error decoding object, invalid type"))
-			return
-		}
-		object, ok = tombstone.Obj.(metav1.Object)
-		if !ok {
-			utilruntime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type"))
-			return
-		}
-		klog.V(4).Infof("Recovered deleted object '%s' from tombstone", object.GetName())
-	}
-	klog.V(4).Infof("Processing object: %s", object.GetName())
-	if ownerRef := metav1.GetControllerOf(object); ownerRef != nil {
-		// If this object is not owned by a Bab, we should not do anything more
-		// with it.
-		if ownerRef.Kind != "Barb" {
-			return
-		}
+	// TODO: Update our local routing table with information from the other node
 
-		barb, err := c.dynLister.Get(ownerRef.Name)
-		if err != nil {
-			klog.V(4).Infof("ignoring orphaned object '%s' of barb '%s'", object.GetName(), ownerRef.Name)
-			return
-		}
-
-		c.enqueueBarb(barb)
-		return
-	}
+	return nil
 }
