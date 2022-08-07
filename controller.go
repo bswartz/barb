@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -87,7 +88,7 @@ func newController(
 		cniDir:      cniDir,
 	}
 
-	klog.Info("Setting up event handlers")
+	klog.InfoS("Setting up event handlers")
 	dynInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.enqueueBarb,
 		UpdateFunc: func(old, new any) {
@@ -105,6 +106,10 @@ func newController(
 			newNode := new.(*corev1.Node)
 			oldNode := old.(*corev1.Node)
 			if newNode.ResourceVersion == oldNode.ResourceVersion {
+				return
+			}
+			if reflect.DeepEqual(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs) &&
+				reflect.DeepEqual(oldNode.Status.Addresses, newNode.Status.Addresses) {
 				return
 			}
 			c.handleNode(new)
@@ -132,7 +137,7 @@ func (c *controller) Run(workers int, stopCh <-chan struct{}) error {
 	defer utilruntime.HandleCrash()
 	defer c.workqueue.ShutDown()
 
-	klog.Info("Starting Barb controller")
+	klog.InfoS("Starting Barb controller")
 
 	var err error
 	err = c.readRoutes(netlink.FAMILY_V4)
@@ -144,19 +149,19 @@ func (c *controller) Run(workers int, stopCh <-chan struct{}) error {
 		return err
 	}
 
-	klog.Info("Waiting for informer caches to sync")
+	klog.InfoS("Waiting for informer caches to sync")
 	if ok := cache.WaitForCacheSync(stopCh, c.nodesSynced, c.dynSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	klog.Info("Starting workers")
+	klog.InfoS("Starting workers")
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
 
-	klog.Info("Started workers")
+	klog.InfoS("Started workers")
 	<-stopCh
-	klog.Info("Shutting down workers")
+	klog.InfoS("Shutting down workers")
 
 	return nil
 }
@@ -514,7 +519,7 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 	// Compare desired/actual barb
 	if barb.Gateway4 == gw4 && barb.Gateway6 == gw6 && barb.Cidr4 == cidr4 && barb.Cidr6 == cidr6 {
 		// No work to do
-		klog.V(2).Info("No change on local node")
+		klog.V(2).InfoS("No change on local node")
 		return nil
 	}
 
