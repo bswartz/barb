@@ -212,6 +212,7 @@ func (c *controller) processNextWorkItem() bool {
 }
 
 func (c *controller) syncNode(ctx context.Context, nodeName string) error {
+	klog.V(3).InfoS("Syncing node", "node", nodeName)
 	var barb *Barb
 	unst, err := c.dynLister.Get(nodeName)
 	if err != nil {
@@ -220,6 +221,7 @@ func (c *controller) syncNode(ctx context.Context, nodeName string) error {
 			return err
 		}
 		// Not found, but that's okay
+		klog.V(3).InfoS("No barb found", "node", nodeName)
 	} else {
 		// Convert the barb object
 		barb = new(Barb)
@@ -228,6 +230,7 @@ func (c *controller) syncNode(ctx context.Context, nodeName string) error {
 			klog.ErrorS(err, "Failed to convert from unstructured")
 			return err
 		}
+		klog.V(3).InfoS("Barb found", "node", nodeName)
 	}
 	if c.nodeName == nodeName {
 		return c.syncSelf(ctx, barb)
@@ -284,8 +287,8 @@ func createBridgeConf(cidr4, cidr6 string) any {
 	}
 
 	return &NetConf{
-		CNIVersion: "0.6.0",
-		Name:       "bridge",
+		CNIVersion: "0.3.1",
+		Name:       "barb",
 		Type:       "bridge",
 		BrName:     "cni0",
 		IsGW:       true,
@@ -426,6 +429,8 @@ func (c *controller) updateRoute(cidr, gw string) error {
 }
 
 func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
+	klog.V(3).Info("Syncing self")
+
 	var err error
 	var node *corev1.Node
 	node, err = c.kubeClient.CoreV1().Nodes().Get(ctx, c.nodeName, metav1.GetOptions{})
@@ -559,6 +564,8 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 }
 
 func (c *controller) syncOtherNode(_ context.Context, barb *Barb) error {
+	klog.V(3).InfoS("Syncing other", "barb", barb.Name)
+
 	changed := false
 	if barb.Cidr4 != "" && c.routes[barb.Cidr4] != barb.Gateway4 {
 		err := c.updateRoute(barb.Cidr4, barb.Gateway4)
