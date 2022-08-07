@@ -24,11 +24,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
-	"k8s.io/client-go/informers"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 )
@@ -72,27 +69,16 @@ func main() {
 		klog.Fatalf("Error building kubeconfig: %s", err.Error())
 	}
 
-	kubeClient, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		klog.Fatalf("Error building kubernetes clientset: %s", err.Error())
-	}
-
-	dynClient, err := dynamic.NewForConfig(cfg)
+	client, err := dynamic.NewForConfig(cfg)
 	if err != nil {
 		klog.Fatalf("Failed to create dynamic client: %v", err)
 	}
 
-	gvr := schema.GroupVersionResource{Group: crdGroup, Version: crdVersion, Resource: crdResource}
+	informerFactory := dynamicinformer.NewDynamicSharedInformerFactory(client, 0)
 
-	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
-	dynInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0)
+	c := newController(client, nodeName, cniDir, informerFactory)
 
-	c := newController(kubeClient, dynClient, gvr, nodeName, cniDir,
-		kubeInformerFactory.Core().V1().Nodes(),
-		dynInformerFactory.ForResource(gvr).Informer())
-
-	kubeInformerFactory.Start(stopCh)
-	dynInformerFactory.Start(stopCh)
+	informerFactory.Start(stopCh)
 
 	if err = c.Run(2, stopCh); err != nil {
 		klog.Fatalf("Error running controller: %s", err.Error())

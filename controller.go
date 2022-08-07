@@ -29,19 +29,15 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/net/context"
 	"golang.org/x/sys/unix"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/dynamic/dynamiclister"
-	coreinformers "k8s.io/client-go/informers/core/v1"
-	"k8s.io/client-go/kubernetes"
-	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -49,15 +45,22 @@ import (
 
 const barbProto = 250
 
+const (
+	crdKind     = "Barb"
+	crdGroup    = "barb.com"
+	crdVersion  = "v1"
+	crdResource = "barbs"
+)
+
 type controller struct {
 	nodeName    string
-	kubeClient  kubernetes.Interface
 	dynClient   dynamic.Interface
-	gvr         schema.GroupVersionResource
-	nodesLister corelisters.NodeLister
+	nodeGvr     schema.GroupVersionResource
+	barbGvr     schema.GroupVersionResource
+	nodeLister  dynamiclister.Lister
 	nodesSynced cache.InformerSynced
-	dynLister   dynamiclister.Lister
-	dynSynced   cache.InformerSynced
+	barbLister  dynamiclister.Lister
+	barbsSynced cache.InformerSynced
 	workqueue   workqueue.RateLimitingInterface
 	lastCidr4   string
 	lastCidr6   string
@@ -66,30 +69,30 @@ type controller struct {
 }
 
 func newController(
-	kubeClient kubernetes.Interface,
 	dynClient dynamic.Interface,
-	gvr schema.GroupVersionResource,
 	nodeName string,
 	cniDir string,
-	nodeInformer coreinformers.NodeInformer,
-	dynInformer cache.SharedIndexInformer,
+	informerFactory dynamicinformer.DynamicSharedInformerFactory,
 ) *controller {
 	c := &controller{
-		nodeName:    nodeName,
-		kubeClient:  kubeClient,
-		dynClient:   dynClient,
-		gvr:         gvr,
-		nodesLister: nodeInformer.Lister(),
-		nodesSynced: nodeInformer.Informer().HasSynced,
-		dynLister:   dynamiclister.New(dynInformer.GetIndexer(), gvr),
-		dynSynced:   dynInformer.HasSynced,
-		workqueue:   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Barbs"),
-		routes:      make(map[string]string),
-		cniDir:      cniDir,
+		nodeName:  nodeName,
+		dynClient: dynClient,
+		nodeGvr:   schema.GroupVersionResource{Group: "", Version: "v1", Resource: "nodes"},
+		barbGvr:   schema.GroupVersionResource{Group: crdGroup, Version: crdVersion, Resource: crdResource},
+		workqueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Barbs"),
+		routes:    make(map[string]string),
+		cniDir:    cniDir,
 	}
 
+	barbInformer := informerFactory.ForResource(c.barbGvr).Informer()
+	c.barbLister = dynamiclister.New(barbInformer.GetIndexer(), c.barbGvr)
+	c.barbsSynced = barbInformer.HasSynced
+	nodeInformer := informerFactory.ForResource(c.barbGvr).Informer()
+	c.nodeLister = dynamiclister.New(nodeInformer.GetIndexer(), c.nodeGvr)
+	c.nodesSynced = nodeInformer.HasSynced
+
 	klog.InfoS("Setting up event handlers")
-	dynInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	barbInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.enqueueBarb,
 		UpdateFunc: func(old, new any) {
 			newBarb := new.(*unstructured.Unstructured)
@@ -100,16 +103,19 @@ func newController(
 			c.enqueueBarb(new)
 		},
 	})
-	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.handleNode,
 		UpdateFunc: func(old, new any) {
-			newNode := new.(*corev1.Node)
-			oldNode := old.(*corev1.Node)
-			if newNode.ResourceVersion == oldNode.ResourceVersion {
+			newNode := new.(*unstructured.Unstructured)
+			oldNode := old.(*unstructured.Unstructured)
+			if newNode.GetResourceVersion() == oldNode.GetResourceVersion() {
 				return
 			}
-			if reflect.DeepEqual(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs) &&
-				reflect.DeepEqual(oldNode.Status.Addresses, newNode.Status.Addresses) {
+			oldCidrs, _, _ := unstructured.NestedStringSlice(oldNode.UnstructuredContent(), "spec", "podCIDRs")
+			newCidrs, _, _ := unstructured.NestedStringSlice(newNode.UnstructuredContent(), "spec", "podCIDRs")
+			oldAddresses, _, _ := unstructured.NestedSlice(oldNode.UnstructuredContent(), "status", "addresses")
+			newAddresses, _, _ := unstructured.NestedSlice(oldNode.UnstructuredContent(), "status", "addresses")
+			if reflect.DeepEqual(oldCidrs, newCidrs) && reflect.DeepEqual(oldAddresses, newAddresses) {
 				return
 			}
 			c.handleNode(new)
@@ -127,9 +133,9 @@ func (c *controller) enqueueBarb(obj any) {
 }
 
 func (c *controller) handleNode(obj any) {
-	node, ok := obj.(*corev1.Node)
-	if ok && c.nodeName == node.Name {
-		c.workqueue.Add(node.Name)
+	node, ok := obj.(*unstructured.Unstructured)
+	if ok && c.nodeName == node.GetName() {
+		c.workqueue.Add(c.nodeName)
 	}
 }
 
@@ -150,7 +156,7 @@ func (c *controller) Run(workers int, stopCh <-chan struct{}) error {
 	}
 
 	klog.InfoS("Waiting for informer caches to sync")
-	if ok := cache.WaitForCacheSync(stopCh, c.nodesSynced, c.dynSynced); !ok {
+	if ok := cache.WaitForCacheSync(stopCh, c.nodesSynced, c.barbsSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
@@ -212,22 +218,13 @@ func (c *controller) processNextWorkItem() bool {
 }
 
 func (c *controller) syncNode(ctx context.Context, nodeName string) error {
-	var barb *Barb
-	unst, err := c.dynLister.Get(nodeName)
+	barb, err := c.barbLister.Get(nodeName)
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			klog.ErrorS(err, "Failed to get barb", "node", nodeName)
 			return err
 		}
 		// Not found, but that's okay
-	} else {
-		// Convert the barb object
-		barb = new(Barb)
-		err = runtime.DefaultUnstructuredConverter.FromUnstructured(unst.UnstructuredContent(), barb)
-		if err != nil {
-			klog.ErrorS(err, "Failed to convert from unstructured")
-			return err
-		}
 	}
 	if c.nodeName == nodeName {
 		return c.syncSelf(ctx, barb)
@@ -425,19 +422,19 @@ func (c *controller) updateRoute(cidr, gw string) error {
 	return nil
 }
 
-func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
-	var err error
-	var node *corev1.Node
-	node, err = c.kubeClient.CoreV1().Nodes().Get(ctx, c.nodeName, metav1.GetOptions{})
+func (c *controller) syncSelf(ctx context.Context, barb *unstructured.Unstructured) error {
+	node, err := c.nodeLister.Get(c.nodeName)
 	if err != nil {
 		klog.ErrorS(err, "Failed to get node", "node", c.nodeName)
 		return err
 	}
+	content := node.UnstructuredContent()
 
 	var gw4, gw6, cidr4, cidr6 string
-	cidrs := node.Spec.PodCIDRs
+	cidrs, _, _ := unstructured.NestedStringSlice(content, "spec", "podCIDRs")
 	if len(cidrs) == 0 {
-		cidrs = []string{node.Spec.PodCIDR}
+		cidr, _, _ := unstructured.NestedString(content, "spec", "podCIDR")
+		cidrs = []string{cidr}
 	}
 	for _, cidr := range cidrs {
 		var n *net.IPNet
@@ -464,10 +461,17 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 		return err
 	}
 
+	addresses, _, _ := unstructured.NestedSlice(content, "status", "addresses")
 	var internalIp string
-	for _, address := range node.Status.Addresses {
-		if address.Type == corev1.NodeInternalIP {
-			internalIp = address.Address
+	for _, address := range addresses {
+		addrContent, ok := address.(map[string]any)
+		if !ok {
+			continue
+		}
+		addrVal, _, _ := unstructured.NestedString(addrContent, "address")
+		addrType, _, _ := unstructured.NestedString(addrContent, "type")
+		if addrType == "InternalIP" {
+			internalIp = addrVal
 			break
 		}
 	}
@@ -503,52 +507,47 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 	}
 
 	needCreate := false
+	var oldGw4, oldGw6, oldCidr4, oldCidr6 string
 	if nil == barb {
-		barb = &Barb{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: fmt.Sprintf("%s/%s", crdGroup, crdVersion),
-				Kind:       crdKind,
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: c.nodeName,
-			},
-		}
 		needCreate = true
+	} else {
+		content = barb.UnstructuredContent()
+		oldGw4, _, _ = unstructured.NestedString(content, "gw4")
+		oldGw6, _, _ = unstructured.NestedString(content, "gw6")
+		oldCidr4, _, _ = unstructured.NestedString(content, "cidr4")
+		oldCidr6, _, _ = unstructured.NestedString(content, "cidr6")
 	}
 
 	// Compare desired/actual barb
-	if barb.Gateway4 == gw4 && barb.Gateway6 == gw6 && barb.Cidr4 == cidr4 && barb.Cidr6 == cidr6 {
+	if oldGw4 == gw4 && oldGw6 == gw6 && oldCidr4 == cidr4 && oldCidr6 == cidr6 {
 		// No work to do
 		klog.V(2).InfoS("No change on local node")
 		return nil
 	}
 
 	// Update the barb
-	barb.Gateway4 = gw4
-	barb.Gateway6 = gw6
-	barb.Cidr4 = cidr4
-	barb.Cidr6 = cidr6
 	klog.V(1).InfoS("Changed information on local node", "gw4", gw4, "gw6", gw6,
 		"cidr4", cidr4, "cidr6", cidr6)
 
-	// Convert to unstructured
-	var object map[string]any
-	object, err = runtime.DefaultUnstructuredConverter.ToUnstructured(barb)
-	if err != nil {
-		klog.ErrorS(err, "Failed to convert to unstructured")
-		return err
-	}
-	unst := &unstructured.Unstructured{Object: object}
+	barb = new(unstructured.Unstructured)
+	barb.SetAPIVersion(fmt.Sprintf("%s/%s", crdGroup, crdVersion))
+	barb.SetKind(crdKind)
+	barb.SetName(c.nodeName)
+	content = barb.UnstructuredContent()
+	_ = unstructured.SetNestedField(content, gw4, "gw4")
+	_ = unstructured.SetNestedField(content, gw6, "gw6")
+	_ = unstructured.SetNestedField(content, cidr4, "cidr4")
+	_ = unstructured.SetNestedField(content, cidr6, "cidr6")
 
 	// Either create or update the barb, as needed
 	if needCreate {
-		_, err = c.dynClient.Resource(c.gvr).Create(ctx, unst, metav1.CreateOptions{})
+		_, err = c.dynClient.Resource(c.barbGvr).Create(ctx, barb, metav1.CreateOptions{})
 		if err != nil {
 			klog.ErrorS(err, "Failed to create barb")
 			return err
 		}
 	} else {
-		_, err = c.dynClient.Resource(c.gvr).Update(ctx, unst, metav1.UpdateOptions{})
+		_, err = c.dynClient.Resource(c.barbGvr).Update(ctx, barb, metav1.UpdateOptions{})
 		if err != nil {
 			klog.ErrorS(err, "Failed to update barb")
 			return err
@@ -558,31 +557,37 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 	return nil
 }
 
-func (c *controller) syncOtherNode(_ context.Context, barb *Barb) error {
+func (c *controller) syncOtherNode(_ context.Context, barb *unstructured.Unstructured) error {
+	name := barb.GetName()
+	content := barb.UnstructuredContent()
+	cidr4, _, _ := unstructured.NestedString(content, "cidr4")
+	cidr6, _, _ := unstructured.NestedString(content, "cidr6")
+	gw4, _, _ := unstructured.NestedString(content, "gw4")
+	gw6, _, _ := unstructured.NestedString(content, "gw6")
 	changed := false
-	if barb.Cidr4 != "" && c.routes[barb.Cidr4] != barb.Gateway4 {
-		err := c.updateRoute(barb.Cidr4, barb.Gateway4)
+	if cidr4 != "" && c.routes[cidr4] != gw4 {
+		err := c.updateRoute(cidr4, gw4)
 		if err != nil {
 			// Logged
 			return err
 		}
-		klog.V(1).InfoS("Updated v4 route", "barb", barb.Name,
-			"gw", barb.Gateway4, "cidr", barb.Cidr4)
+		klog.V(1).InfoS("Updated v4 route", "barb", name,
+			"gw", gw4, "cidr", cidr4)
 		changed = true
 	}
-	if barb.Cidr6 != "" && c.routes[barb.Cidr6] != barb.Gateway6 {
-		err := c.updateRoute(barb.Cidr6, barb.Gateway6)
+	if cidr6 != "" && c.routes[cidr6] != gw6 {
+		err := c.updateRoute(cidr6, gw6)
 		if err != nil {
 			// Logged
 			return err
 		}
-		klog.V(1).InfoS("Updated v6 route", "barb", barb.Name,
-			"gw", barb.Gateway6, "cidr", barb.Cidr6)
+		klog.V(1).InfoS("Updated v6 route", "barb", name,
+			"gw", gw6, "cidr", cidr6)
 		changed = true
 	}
 	if !changed {
 		// No work to do
-		klog.V(2).InfoS("No changed routes on barb", "barb", barb.Name)
+		klog.V(2).InfoS("No changed routes on barb", "barb", name)
 		return nil
 	}
 
