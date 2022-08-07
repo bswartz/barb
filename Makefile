@@ -19,6 +19,9 @@ export GOOS=linux
 export GOARCH=amd64
 REV=$(shell git describe --long --tags --match='v*' --dirty)
 
+TAG?=canary
+REF?=quay.io/bswartz/barb:$(TAG)
+
 all: build
 
 compile:
@@ -26,6 +29,9 @@ compile:
 	go build -ldflags '-s -w -X main.version=$(REV)' -o bin/barb *.go
 
 build: compile
-	deploy/build.sh quay.io/bswartz/barb:canary
+	deploy/build.sh $(REF)
 
-.PHONY: all compile build
+release: build
+	buildah push $(REF)
+
+.PHONY: all compile build release

@@ -195,7 +195,7 @@ func (c *controller) processNextWorkItem() bool {
 		// Finally, if no error occurs we Forget this item so it does not
 		// get queued again until another change happens.
 		c.workqueue.Forget(obj)
-		klog.Infof("Successfully synced '%s'", nodeName)
+		klog.InfoS("Successfully synced", "node", nodeName)
 		return nil
 	}(obj)
 	if err != nil {
