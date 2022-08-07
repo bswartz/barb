@@ -54,7 +54,7 @@ func main() {
 		log.Fatalf("node-name is a required argument")
 	}
 
-	klog.InfoS("Starting", "version", version)
+	klog.InfoS("Starting", "version", version, "node", nodeName)
 
 	// set up signals so we handle the first shutdown signal gracefully
 	stopCh := make(chan struct{})
@@ -82,7 +82,7 @@ func main() {
 		klog.Fatalf("Failed to create dynamic client: %v", err)
 	}
 
-	gvr := schema.GroupVersionResource{Group: "barb.com", Version: "v1", Resource: "barbs"}
+	gvr := schema.GroupVersionResource{Group: crdGroup, Version: crdVersion, Resource: crdResource}
 
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
 	dynInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0)

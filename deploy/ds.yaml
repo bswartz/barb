@@ -37,6 +37,7 @@ spec:
           args:
             - --node-name=$(KUBE_NODE_NAME)
             - --cni-dir=/cni
+            - --v=2
           env:
             - name: KUBE_NODE_NAME
               valueFrom:

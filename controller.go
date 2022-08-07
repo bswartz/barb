@@ -115,14 +115,14 @@ func newController(
 }
 
 func (c *controller) enqueueBarb(obj any) {
-	barb, ok := obj.(unstructured.Unstructured)
+	barb, ok := obj.(*unstructured.Unstructured)
 	if ok {
 		c.workqueue.Add(barb.GetName())
 	}
 }
 
 func (c *controller) handleNode(obj any) {
-	node, ok := obj.(corev1.Node)
+	node, ok := obj.(*corev1.Node)
 	if ok && c.nodeName == node.Name {
 		c.workqueue.Add(node.Name)
 	}
@@ -208,16 +208,19 @@ func (c *controller) processNextWorkItem() bool {
 
 func (c *controller) syncNode(ctx context.Context, nodeName string) error {
 	var barb *Barb
-	unst, err := c.dynLister.Get(c.nodeName)
+	unst, err := c.dynLister.Get(nodeName)
 	if err != nil {
 		if !errors.IsNotFound(err) {
+			klog.ErrorS(err, "Failed to get barb", "node", nodeName)
 			return err
 		}
+		// Not found, but that's okay
 	} else {
 		// Convert the barb object
 		barb = new(Barb)
 		err = runtime.DefaultUnstructuredConverter.FromUnstructured(unst.UnstructuredContent(), barb)
 		if err != nil {
+			klog.ErrorS(err, "Failed to convert from unstructured")
 			return err
 		}
 	}
@@ -300,6 +303,7 @@ func (c *controller) configureBridge(cidr4, cidr6 string) error {
 	tmpPath := confPath + ".tmp"
 	f, err := os.Create(tmpPath)
 	if err != nil {
+		klog.ErrorS(err, "Failed to create CNI config file")
 		return err
 	}
 
@@ -307,11 +311,13 @@ func (c *controller) configureBridge(cidr4, cidr6 string) error {
 	err = json.NewEncoder(f).Encode(conf)
 	f.Close()
 	if err != nil {
+		klog.ErrorS(err, "Failed to write CNI config file")
 		return err
 	}
 
 	err = os.Rename(tmpPath, confPath)
 	if err != nil {
+		klog.ErrorS(err, "Failed to rename CNI config file")
 		return err
 	}
 
@@ -332,15 +338,21 @@ func isLinkLocak(ip net.IP) bool {
 	}
 }
 
-func findOtherAddress(ip net.IP) (*net.IP, error) {
+func matchAddrFamily(x, y net.IP) bool {
+	return x.To4() != nil && y.To4() != nil || x.To16() != nil && x.To4() == nil && y.To16() != nil && y.To4() == nil
+}
+
+func findOtherAddress(ip net.IP) (net.IP, error) {
 	links, err := netlink.LinkList()
 	if err != nil {
+		klog.ErrorS(err, "Failed to list links")
 		return nil, err
 	}
 	for _, link := range links {
 		var addrs []netlink.Addr
 		addrs, err = netlink.AddrList(link, netlink.FAMILY_ALL)
 		if err != nil {
+			klog.ErrorS(err, "Failed to list addresses", "link", link)
 			return nil, err
 		}
 		found := false
@@ -348,7 +360,7 @@ func findOtherAddress(ip net.IP) (*net.IP, error) {
 		for _, addr := range addrs {
 			if ip.Equal(addr.IP) {
 				found = true
-			} else if len(addr.IP) == len(ip) {
+			} else if matchAddrFamily(addr.IP, ip) {
 				// Same addr type
 				continue
 			} else if isLinkLocak(addr.IP) {
@@ -358,15 +370,17 @@ func findOtherAddress(ip net.IP) (*net.IP, error) {
 			}
 		}
 		if found {
-			return &otherIp, nil
+			return otherIp, nil
 		}
 	}
+	klog.ErrorS(nil, "No link found that matches address", "ip", ip)
 	return nil, fmt.Errorf("no link found")
 }
 
 func (c *controller) readRoutes(family int) error {
 	routes, err := netlink.RouteList(nil, family)
 	if err != nil {
+		klog.ErrorS(err, "Failed to list routes")
 		return err
 	}
 	for _, route := range routes {
@@ -382,6 +396,7 @@ func (c *controller) readRoutes(family int) error {
 func (c *controller) updateRoute(cidr, gw string) error {
 	_, dst, err := net.ParseCIDR(cidr)
 	if err != nil {
+		klog.ErrorS(err, "Failed to parse CIDR", "cidr", cidr)
 		return err
 	}
 
@@ -395,6 +410,7 @@ func (c *controller) updateRoute(cidr, gw string) error {
 
 	err = netlink.RouteReplace(route)
 	if err != nil {
+		klog.ErrorS(err, "Failed to replace route")
 		return err
 	}
 
@@ -409,6 +425,7 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 	var node *corev1.Node
 	node, err = c.kubeClient.CoreV1().Nodes().Get(ctx, c.nodeName, metav1.GetOptions{})
 	if err != nil {
+		klog.ErrorS(err, "Failed to get node", "node", c.nodeName)
 		return err
 	}
 
@@ -421,7 +438,7 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 		var n *net.IPNet
 		_, n, err = net.ParseCIDR(cidr)
 		if err != nil {
-			klog.ErrorS(err, "invalid cidr", "cidr", cidr)
+			klog.ErrorS(err, "Invalid cidr", "cidr", cidr)
 			return err
 		}
 		switch len(n.IP) {
@@ -431,13 +448,14 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 			cidr6 = cidr
 		default:
 			err = fmt.Errorf("unknown IP address type")
-			klog.ErrorS(err, "unknown IP address type", "ip", n.IP)
+			klog.ErrorS(err, "Unknown IP address type", "ip", n.IP)
 			return err
 		}
 	}
 
 	err = c.configureBridge(cidr4, cidr6)
 	if err != nil {
+		// Logged
 		return err
 	}
 
@@ -449,7 +467,7 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 		}
 	}
 	if "" == internalIp {
-		klog.Info("Node doesn't have internal IP yet")
+		klog.Warning("Node doesn't have internal IP yet")
 		return nil
 	}
 	ip := net.ParseIP(internalIp)
@@ -460,38 +478,43 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 	}
 	// The node will only have an IPv4 or an IPv6, so find the other IP
 	// on the same link.
-	var otherIp *net.IP
+	var otherIp net.IP
 	otherIp, err = findOtherAddress(ip)
 	if err != nil {
+		// Logged
 		return err
 	}
 
-	switch len(ip) {
-	case net.IPv4len:
+	if ip.To4() != nil {
 		gw4 = internalIp
 		if otherIp != nil {
 			gw6 = otherIp.String()
 		}
-	case net.IPv6len:
+	} else {
 		gw6 = internalIp
 		if otherIp != nil {
 			gw4 = otherIp.String()
 		}
-	default:
-		err = fmt.Errorf("unknown IP address type")
-		klog.ErrorS(err, "unknown IP address type", "ip", ip)
-		return err
 	}
 
 	needCreate := false
 	if nil == barb {
-		barb = new(Barb)
+		barb = &Barb{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: fmt.Sprintf("%s/%s", crdGroup, crdVersion),
+				Kind:       crdKind,
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: c.nodeName,
+			},
+		}
 		needCreate = true
 	}
 
 	// Compare desired/actual barb
-	if barb.Gateway4 == gw4 && barb.Gateway6 == gw6 && barb.Cidr4 == cidr4 && barb.Cidr4 == cidr6 {
+	if barb.Gateway4 == gw4 && barb.Gateway6 == gw6 && barb.Cidr4 == cidr4 && barb.Cidr6 == cidr6 {
 		// No work to do
+		klog.V(2).Info("No change on local node")
 		return nil
 	}
 
@@ -499,12 +522,15 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 	barb.Gateway4 = gw4
 	barb.Gateway6 = gw6
 	barb.Cidr4 = cidr4
-	barb.Cidr4 = cidr6
+	barb.Cidr6 = cidr6
+	klog.V(1).InfoS("Changed information on local node", "gw4", gw4, "gw6", gw6,
+		"cidr4", cidr4, "cidr6", cidr6)
 
 	// Convert to unstructured
 	var object map[string]any
 	object, err = runtime.DefaultUnstructuredConverter.ToUnstructured(barb)
 	if err != nil {
+		klog.ErrorS(err, "Failed to convert to unstructured")
 		return err
 	}
 	unst := &unstructured.Unstructured{Object: object}
@@ -513,11 +539,13 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 	if needCreate {
 		_, err = c.dynClient.Resource(c.gvr).Create(ctx, unst, metav1.CreateOptions{})
 		if err != nil {
+			klog.ErrorS(err, "Failed to create barb")
 			return err
 		}
 	} else {
 		_, err = c.dynClient.Resource(c.gvr).Update(ctx, unst, metav1.UpdateOptions{})
 		if err != nil {
+			klog.ErrorS(err, "Failed to update barb")
 			return err
 		}
 	}
@@ -526,24 +554,31 @@ func (c *controller) syncSelf(ctx context.Context, barb *Barb) error {
 }
 
 func (c *controller) syncOtherNode(_ context.Context, barb *Barb) error {
-	actualGw4 := c.routes[barb.Cidr4]
-	actualGw6 := c.routes[barb.Cidr6]
-	if actualGw4 == barb.Gateway4 && actualGw6 == barb.Gateway6 {
-		// No work to do
-		return nil
-	}
-
-	if actualGw4 != barb.Gateway4 {
+	changed := false
+	if barb.Cidr4 != "" && c.routes[barb.Cidr4] != barb.Gateway4 {
 		err := c.updateRoute(barb.Cidr4, barb.Gateway4)
 		if err != nil {
+			// Logged
 			return err
 		}
+		klog.V(1).InfoS("Updated v4 route", "barb", barb.Name,
+			"gw", barb.Gateway4, "cidr", barb.Cidr4)
+		changed = true
 	}
-	if actualGw6 != barb.Gateway6 {
+	if barb.Cidr6 != "" && c.routes[barb.Cidr6] != barb.Gateway6 {
 		err := c.updateRoute(barb.Cidr6, barb.Gateway6)
 		if err != nil {
+			// Logged
 			return err
 		}
+		klog.V(1).InfoS("Updated v6 route", "barb", barb.Name,
+			"gw", barb.Gateway6, "cidr", barb.Cidr6)
+		changed = true
+	}
+	if !changed {
+		// No work to do
+		klog.V(2).InfoS("No changed routes on barb", "barb", barb.Name)
+		return nil
 	}
 
 	return nil
